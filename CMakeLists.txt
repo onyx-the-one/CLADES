@@ -67,6 +67,7 @@ add_executable(clades
     main.cpp
     model.cpp
     io.cpp
+    age_strat.cpp
 )
 target_include_directories(clades PRIVATE .)
 target_link_libraries(clades PRIVATE imgui_lib implot_lib)
