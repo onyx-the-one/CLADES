@@ -4,6 +4,9 @@
 
 #include "model.hpp"
 #include "io.hpp"
+#include "age_strat.hpp"
+
+AgeSimResult run_age_ensemble(const Params&, const AgeParams&, ProgressCb);
 
 #include <imgui.h>
 #include <imgui_impl_sdl2.h>
@@ -115,6 +118,13 @@ struct AppState {
     char   export_csv_path[512] = "clades_result.csv";
     std::string status_msg;
     bool   show_about = false;
+
+    // age-stratified extension
+    AgeParams  age_params;
+    AgeSimResult age_result;
+    bool has_age_result = false;
+    bool age_mode = false; // toggle between homogeneous / age-stratified
+    bool show_contact_matrix = false;
 };
 
 static AppState g;
@@ -123,10 +133,10 @@ static AppState g;
 
 static void sim_thread_fn()
 {
-    Params p;
-    { // snapshot under lock isn't needed (params are UI-side only) but let's be clear
-        p = g.params;
-    }
+    Params    p  = g.params;
+    AgeParams ap = g.age_params;
+    bool age_mode = g.age_mode;
+
     g.progress_run = 0;
     g.total_days = p.T_days;
 
@@ -136,9 +146,14 @@ static void sim_thread_fn()
         (void)rn; (void)tdays;
     };
 
-    SimResult sr = run_ensemble(p, cb);
-
-    {
+    if (age_mode) {
+        ap.enabled = true;
+        AgeSimResult asr = run_age_ensemble(p, ap, cb);
+        std::lock_guard<std::mutex> lk(g.result_mtx);
+        g.age_result     = std::move(asr);
+        g.has_age_result = true;
+    } else {
+        SimResult sr = run_ensemble(p, cb);
         std::lock_guard<std::mutex> lk(g.result_mtx);
         g.result     = std::move(sr);
         g.has_result = true;
@@ -378,6 +393,215 @@ static void about_window()
     ImGui::End();
 }
 
+
+// ---- contact matrix editor -------------------------------------------------
+
+static void contact_matrix_window()
+{
+    ImGui::SetNextWindowSize(ImVec2(600, 520), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Contact Matrix Editor", &g.show_contact_matrix)) {
+        ImGui::End(); return;
+    }
+    ImGui::TextUnformatted("C[i][j] = mean daily contacts age group i -> j");
+    ImGui::TextUnformatted("Default: POLYMOD European average (Mossong 2008 / Prem 2017)");
+    ImGui::Separator();
+
+    ImGui::BeginChild("##cmtx", ImVec2(0, 360), false, ImGuiWindowFlags_HorizontalScrollbar);
+    // header row
+    ImGui::TextUnformatted("       ");
+    for (int j = 0; j < N_AGE; ++j) {
+        ImGui::SameLine();
+        ImGui::Text("%6s", AGE_LABELS[j]);
+    }
+    for (int i = 0; i < N_AGE; ++i) {
+        ImGui::Text("%6s", AGE_LABELS[i]);
+        for (int j = 0; j < N_AGE; ++j) {
+            ImGui::SameLine();
+            char lbl[32]; snprintf(lbl, sizeof(lbl), "##c%d%d", i, j);
+            ImGui::SetNextItemWidth(58);
+            ImGui::InputDouble(lbl, &g.age_params.C[i][j], 0, 0, "%.2f");
+        }
+    }
+    ImGui::EndChild();
+
+    if (ImGui::Button("Reset to POLYMOD defaults")) {
+        for (int i = 0; i < N_AGE; ++i)
+            for (int j = 0; j < N_AGE; ++j)
+                g.age_params.C[i][j] = POLYMOD_DEFAULT[i][j];
+    }
+    ImGui::SameLine();
+    // Symmetrise: C_sym[i][j] = (C[i][j]*N[i] + C[j][i]*N[j]) / (2*N[i])
+    if (ImGui::Button("Symmetrise (reciprocal)")) {
+        double N_g[N_AGE];
+        double Ntot = g.params.N;
+        for (int i = 0; i < N_AGE; ++i) N_g[i] = g.age_params.pop_frac[i] * Ntot;
+        for (int i = 0; i < N_AGE; ++i)
+            for (int j = i+1; j < N_AGE; ++j) {
+                double sym = (g.age_params.C[i][j]*N_g[i] + g.age_params.C[j][i]*N_g[j])
+                              / (2.0 * std::max(N_g[i], 1.0));
+                double symT= (g.age_params.C[i][j]*N_g[i] + g.age_params.C[j][i]*N_g[j])
+                              / (2.0 * std::max(N_g[j], 1.0));
+                g.age_params.C[i][j] = sym;
+                g.age_params.C[j][i] = symT;
+            }
+    }
+    ImGui::End();
+}
+
+// ---- age parameter panel (tab inside left pane) ----------------------------
+
+static void age_param_panel()
+{
+    ImGui::Checkbox("Enable age-stratified mode", &g.age_mode);
+    if (!g.age_mode) {
+        ImGui::TextDisabled("Enable to unlock age-stratified settings.");
+        return;
+    }
+    ImGui::Spacing();
+    if (ImGui::Button("Edit Contact Matrix..."))
+        g.show_contact_matrix = true;
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Population fractions (must sum to 1):");
+    double sum = 0;
+    for (int i = 0; i < N_AGE; ++i) sum += g.age_params.pop_frac[i];
+    ImGui::LabelText("Current sum", "%.4f %s", sum, (std::fabs(sum-1.0) > 0.01) ? "(!)" : "OK");
+
+    if (ImGui::BeginTable("##agefracs", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Group"); ImGui::TableSetupColumn("Pop frac"); ImGui::TableSetupColumn("Vax uptake");
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < N_AGE; ++i) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(AGE_LABELS[i]);
+            ImGui::TableSetColumnIndex(1);
+            char lbl[32]; snprintf(lbl, sizeof(lbl), "##pf%d", i);
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputDouble(lbl, &g.age_params.pop_frac[i], 0, 0, "%.4f");
+            ImGui::TableSetColumnIndex(2);
+            snprintf(lbl, sizeof(lbl), "##vu%d", i);
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputDouble(lbl, &g.age_params.vax_uptake[i], 0, 0, "%.3f");
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Per-group IFR and hospitalisation rate:");
+    if (ImGui::BeginTable("##ageifr", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Group"); ImGui::TableSetupColumn("IFR"); ImGui::TableSetupColumn("Hosp rate");
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < N_AGE; ++i) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(AGE_LABELS[i]);
+            ImGui::TableSetColumnIndex(1);
+            char lbl[32]; snprintf(lbl, sizeof(lbl), "##ifr%d", i);
+            ImGui::SetNextItemWidth(90);
+            ImGui::InputDouble(lbl, &g.age_params.ifr[i], 0, 0, "%.5f");
+            ImGui::TableSetColumnIndex(2);
+            snprintf(lbl, sizeof(lbl), "##hr%d", i);
+            ImGui::SetNextItemWidth(90);
+            ImGui::InputDouble(lbl, &g.age_params.hosp_rate[i], 0, 0, "%.4f");
+        }
+        ImGui::EndTable();
+    }
+
+    if (ImGui::Button("Reset IFR to COVID-like defaults")) {
+        for (int i = 0; i < N_AGE; ++i) {
+            g.age_params.ifr[i]       = IFR_DEFAULT[i];
+            g.age_params.hosp_rate[i] = HOSP_DEFAULT[i];
+        }
+    }
+}
+
+// ---- age results plot panel ------------------------------------------------
+
+static void age_plot_panel()
+{
+    std::lock_guard<std::mutex> lk(g.result_mtx);
+    if (!g.has_age_result) {
+        ImGui::TextUnformatted("Run simulation in age-stratified mode to see age plots.");
+        return;
+    }
+
+    auto& m = g.age_result.mean;
+    size_t n = m.ts.size();
+    static std::vector<double> xs;
+    xs.resize(n);
+    for (size_t t = 0; t < n; ++t) xs[t] = (double)t;
+
+    float pw = ImGui::GetContentRegionAvail().x;
+
+    // Infectious by age group
+    if (ImPlot::BeginPlot("Infectious by Age Group##aI", ImVec2(pw, 240))) {
+        ImPlot::SetupAxes("Day", "I(t)");
+        static const ImVec4 age_colors[N_AGE] = {
+            {0.2f,0.6f,1.0f,1}, {0.2f,0.9f,0.5f,1}, {1.0f,0.8f,0.1f,1}, {1.0f,0.4f,0.1f,1},
+            {0.9f,0.1f,0.3f,1}, {0.6f,0.1f,0.9f,1}, {0.1f,0.7f,0.9f,1}, {0.5f,0.5f,0.5f,1},
+        };
+        static std::vector<double> Ig(0);
+        Ig.resize(n);
+        for (int i = 0; i < N_AGE; ++i) {
+            for (size_t t = 0; t < n; ++t) Ig[t] = m.ts[t].s.I[i];
+            ImPlot::SetNextLineStyle(age_colors[i]);
+            ImPlot::PlotLine(AGE_LABELS[i], xs.data(), Ig.data(), (int)n);
+        }
+        ImPlot::EndPlot();
+    }
+
+    // Deaths by age group
+    if (ImPlot::BeginPlot("Cumulative Deaths by Age##aD", ImVec2(pw, 240))) {
+        ImPlot::SetupAxes("Day", "D(t)");
+        static std::vector<double> Dg(0);
+        Dg.resize(n);
+        for (int i = 0; i < N_AGE; ++i) {
+            for (size_t t = 0; t < n; ++t) Dg[t] = m.ts[t].s.D[i];
+            ImPlot::PlotLine(AGE_LABELS[i], xs.data(), Dg.data(), (int)n);
+        }
+        ImPlot::EndPlot();
+    }
+
+    // Rt by age group
+    if (ImPlot::BeginPlot("Rt by Age Group##aRt", ImVec2(pw, 200))) {
+        ImPlot::SetupAxes("Day", "Rt");
+        static std::vector<double> Rg(0);
+        Rg.resize(n);
+        for (int i = 0; i < N_AGE; ++i) {
+            for (size_t t = 0; t < n; ++t) Rg[t] = m.ts[t].s.Rt[i];
+            ImPlot::PlotLine(AGE_LABELS[i], xs.data(), Rg.data(), (int)n);
+        }
+        double lx[2] = {xs.front(), xs.back()}, ly[2] = {1.0, 1.0};
+        ImPlot::SetNextLineStyle(ImVec4(0.8f,0,0,1));
+        ImPlot::PlotLine("Rt=1", lx, ly, 2);
+        ImPlot::EndPlot();
+    }
+}
+
+// ---- age summary panel -----------------------------------------------------
+
+static void age_summary_panel()
+{
+    std::lock_guard<std::mutex> lk(g.result_mtx);
+    if (!g.has_age_result) { ImGui::TextUnformatted("No age results."); return; }
+    auto& r = g.age_result.mean;
+    ImGui::LabelText("Overall attack rate", "%.2f%%", r.total_attack_rate * 100.0);
+    ImGui::Separator();
+    if (ImGui::BeginTable("##agesum", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Group");
+        ImGui::TableSetupColumn("Peak I");
+        ImGui::TableSetupColumn("Peak day");
+        ImGui::TableSetupColumn("Total D");
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < N_AGE; ++i) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(AGE_LABELS[i]);
+            ImGui::TableSetColumnIndex(1); ImGui::Text("%.0f", r.peak_I[i]);
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%.1f", r.peak_day[i]);
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%.0f", r.total_D[i]);
+        }
+        ImGui::EndTable();
+    }
+}
+
 // ---- main -------------------------------------------------------------------
 
 int main(int, char**)
@@ -478,6 +702,10 @@ int main(int, char**)
                 param_panel();
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Age Groups")) {
+                age_param_panel();
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("Files")) {
                 ImGui::TextUnformatted("Load/Save parameter file:");
                 ImGui::InputText("##lpath", g.load_path, sizeof(g.load_path));
@@ -498,6 +726,20 @@ int main(int, char**)
                     std::string err = export_csv(g.export_csv_path);
                     g.status_msg = err.empty() ? "Exported." : err;
                 }
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::TextUnformatted("Age-stratified parameter file:");
+                static char age_path[512] = "clades_age.ini";
+                ImGui::InputText("##agepath", age_path, sizeof(age_path));
+                if (ImGui::Button("Load Age")) {
+                    std::string err = load_age_params(g.age_params, age_path);
+                    g.status_msg = err.empty() ? "Age params loaded." : err;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Save Age")) {
+                    std::string err = save_age_params(g.age_params, age_path);
+                    g.status_msg = err.empty() ? "Age params saved." : err;
+                }
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -515,6 +757,14 @@ int main(int, char**)
             }
             if (ImGui::BeginTabItem("Summary")) {
                 results_summary();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Age Plots")) {
+                age_plot_panel();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Age Summary")) {
+                age_summary_panel();
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -552,6 +802,7 @@ int main(int, char**)
         ImGui::End();
 
         if (g.show_about) about_window();
+        if (g.show_contact_matrix) contact_matrix_window();
 
         // render
         ImGui::Render();
