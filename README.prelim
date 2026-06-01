@@ -1,0 +1,8 @@
+# Preliminary readme - jsut notes
+# Build for linux (dnf):
+sudo dnf install libsd12-dev libgl-dev
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+./build/clades
+
+#main branch is "stable" (sure buddy), dev is integration

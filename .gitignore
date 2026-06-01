@@ -1,0 +1,7 @@
+build/
+*.ini
+*.csv
+*.a
+*.o
+.cache/
+compile_commands.json
