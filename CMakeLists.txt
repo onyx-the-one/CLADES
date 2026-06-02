@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
+cmake_policy(SET CMP0135 NEW)
 project(clades VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -18,6 +19,7 @@ find_package(SDL2 QUIET)
 if(NOT SDL2_FOUND)
     FetchContent_Declare(SDL2
         URL https://github.com/libsdl-org/SDL/releases/download/release-2.30.2/SDL2-2.30.2.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     set(SDL_SHARED OFF CACHE BOOL "" FORCE)
     set(SDL_STATIC ON  CACHE BOOL "" FORCE)
@@ -27,6 +29,7 @@ endif()
 # ---- Dear ImGui ------------------------------------------------------------
 FetchContent_Declare(imgui
     URL https://github.com/ocornut/imgui/archive/refs/tags/v1.90.8.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(imgui)
 
@@ -52,6 +55,7 @@ endif()
 # ---- ImPlot ----------------------------------------------------------------
 FetchContent_Declare(implot
     URL https://github.com/epezent/implot/archive/refs/tags/v0.16.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(implot)
 
