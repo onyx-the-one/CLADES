@@ -30,13 +30,13 @@ cmake --build build -j$(nproc)
 Should work on Windows/macOS too, SDL2 will be fetched if not found.
 
 ## Files
-'''
+```
 model.hpp - all types (Params, DayState, SimResult)
 model.cpp - integrator + ensemble runner
 io.hpp/cpp - INI-style param import/export
 main.cpp - ImGui/ImPlot frontend
 CMakeLists.txt
-'''
+```
 
 
 ## Params file
