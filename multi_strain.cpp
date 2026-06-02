@@ -2,30 +2,31 @@
 #include <cmath>
 #include <random>
 #include <algorithm>
-#include <stdexcept>
 
 // Multi-strain SEIVRD integrator.
 //
-// Shared S pool formulation (Castillo-Chavez style):
-//   dS/dt = mu*N + sum_k(omega_k*R_k) + omega_v*V
-//           - S * sum_k(lambda_k) - vax_flow - mu*S
-//
-// Each recovered class R_k has partial susceptibility to other strains.
-// Effective new infections of strain k from R_j class:
-//   (1 - X[k][j]) * lambda_k * R_j
-// where X[k][j] is cross_immunity[k][j].
-//
-// Vaccination: shared V pool. Vaccine protects against strain k proportionally
-// to vax_cross[k], i.e. breakthrough rate = (1 - vax_cross[k]).
-
-static double ou_step(double b, double b0, double theta, double sigma, double dt, double dW)
-{
-	    return b + theta * (b0 - b) * dt + sigma * b0 * dW;
-}
+// Core correctness rules:
+//  1. All outflows from a compartment are computed as rates first.
+//  2. cap_outflows() scales them down if they'd drain more than the compartment holds.
+//  3. Transfers are accounted in BOTH source and destination.
+//  4. No compartment goes negative (floor as last resort only for fp dust).
+//  5. Per-strain deaths tracked individually.
 
 static double season_b(const Params& p, double day, double b)
 {
 	    return b * (1.0 + p.season_amp * std::cos(2.0 * M_PI * (day - p.season_phi) / 365.0));
+}
+
+// Scale outflow rates[] so sum*dt <= available. Modifies in-place.
+static void cap_outflows(double* rates, int n, double available, double dt)
+{
+	    double demand = 0;
+    for (int i = 0; i < n; ++i) demand += rates[i];
+    demand *= dt;
+    if (demand > available && demand > 0) {
+	        double scale = available / demand;
+        for (int i = 0; i < n; ++i) rates[i] *= scale;
+    }
 }
 
 static MSRunResult single_ms_run(const Params& p, const MultiStrainParams& mp, uint64_t seed)
@@ -36,167 +37,211 @@ static MSRunResult single_ms_run(const Params& p, const MultiStrainParams& mp, u
     const double N = p.N;
 
     std::mt19937_64 rng(seed);
-    std::normal_distribution<double> norm(0.0, 1.0);
+    std::normal_distribution<double> norm01(0.0, 1.0);
 
-    // OU beta per strain (starts at strain-specific beta)
-    std::array<double, MAX_STRAINS> beta_ou;
-    for (int k = 0; k < K; ++k)
-        beta_ou[k] = mp.strains[k].beta;
+    std::array<double, MAX_STRAINS> beta_ou{};
+    for (int k = 0; k < K; ++k) beta_ou[k] = mp.strains[k].beta;
 
-    // Initialise compartments
-    // strain 0 seeded at t=0, others at their intro_day
+    double S = N, V = 0;
     StrainCompartments c{};
-    double S = N;
-    double V = 0;
 
+    // seed infections at t=0
     for (int k = 0; k < K; ++k) {
-	        if (!mp.strains[k].enabled) continue;
-        if (mp.strains[k].intro_day <= 0) {
-	            c.I[k] = mp.strains[k].intro_size;
-            S -= c.I[k];
-        }
+	        if (!mp.strains[k].enabled || mp.strains[k].intro_day > 0) continue;
+        double sz = std::min(mp.strains[k].intro_size, S);
+        c.I[k] += sz; S -= sz;
     }
-    S -= p.E0; // a bit of initial E in strain 0
-    c.E[0] += p.E0;
+    double e0 = std::min(p.E0, S);
+    c.E[0] += e0; S -= e0;
 
     MSRunResult res;
     res.ts.reserve(steps + 1);
-    res.total_attack_rate = 0;
-    for (int k = 0; k < K; ++k) {
-	        res.peak_I[k]  = c.I[k];
-        res.peak_day[k]= 0;
-        res.total_D[k] = 0;
-    }
+    for (int k = 0; k < K; ++k) { res.peak_I[k] = c.I[k]; res.peak_day[k] = 0; res.total_D[k] = 0; }
 
     auto rec = [&](double /*day*/) {
-	        MSDay d;
-        d.S = S; d.V = V; d.c = c;
+	        MSDay d; d.S = S; d.V = V; d.c = c; d.beta_eff = beta_ou[0];
         for (int k = 0; k < K; ++k) {
-	            double sb = beta_ou[k];
-            // Rt_k = beta_k * (S_eff) / (N * gamma_k)
-            // S_eff accounts for partial susceptibility in R classes
-            double S_eff = S;
+	            double S_eff = S + V * (1.0 - mp.strains[k].vax_cross);
             for (int j = 0; j < K; ++j)
                 S_eff += (1.0 - mp.cross_immunity[k][j]) * c.R[j];
-            S_eff += V * (1.0 - mp.strains[k].vax_cross);
             double g = mp.strains[k].gamma;
-            d.Rt[k] = (g > 0) ? sb * S_eff / (N * g) : 0.0;
+            d.Rt[k] = (g > 0 && N > 0) ? beta_ou[k] * S_eff / (N * g) : 0.0;
         }
-        d.beta_eff = beta_ou[0];
         res.ts.push_back(d);
     };
 
     rec(0.0);
 
-    double max_vax = p.vax_cov * N;
+    const double max_vax = p.vax_cov * N;
 
     for (int step = 0; step < steps; ++step) {
 	        double day = step * dt;
 
-        // OU update for each strain's beta
+        // OU update on each strain's beta
         for (int k = 0; k < K; ++k) {
-	            double dW = std::sqrt(dt) * norm(rng);
-            beta_ou[k] = ou_step(beta_ou[k], mp.strains[k].beta,
-                                  p.noise_theta, p.noise_sigma, dt, dW);
+	            double dW = std::sqrt(dt) * norm01(rng);
+            beta_ou[k] += p.noise_theta * (mp.strains[k].beta - beta_ou[k]) * dt
+                        + p.noise_sigma * mp.strains[k].beta * dW;
             beta_ou[k] = std::max(0.0, beta_ou[k]);
         }
 
-        // Seed introductions: check if any strain crosses its intro_day this step
-        for (int k = 1; k < K; ++k) {
+        // Scheduled introductions
+        for (int k = 0; k < K; ++k) {
 	            if (!mp.strains[k].enabled) continue;
             double intro = mp.strains[k].intro_day;
-            if (day < intro && day + dt >= intro) {
+            if (intro > 0 && day < intro && day + dt >= intro) {
 	                double sz = std::min(mp.strains[k].intro_size, S);
-                c.I[k] += sz;
-                S -= sz;
+                c.I[k] += sz; S -= sz;
             }
         }
 
-        // Force of infection per strain on S, V, and each R_j
-        // lambda_k = b_k * I_k / N  (frequency-dependent transmission)
+        // Force of infection (rates, not yet * dt)
         std::array<double, MAX_STRAINS> lam{};
         for (int k = 0; k < K; ++k) {
-	            if (!mp.strains[k].enabled) continue;
-            double b = season_b(p, day, beta_ou[k]);
-            lam[k] = b * c.I[k] / N;
+	            if (!mp.strains[k].enabled || N <= 0) continue;
+            lam[k] = season_b(p, day, beta_ou[k]) * c.I[k] / N;
         }
 
-        // Flows from S
-        double sum_lam = 0;
-        for (int k = 0; k < K; ++k) sum_lam += lam[k];
+        // ---- S outflows ----
+        // To E[k] via infection, to V via vaccination, background death
+        std::array<double, MAX_STRAINS + 2> S_out{};
+        for (int k = 0; k < K; ++k) S_out[k] = lam[k] * S;
+        double vax_avail_rate = std::max(0.0, max_vax - V) / dt; // max rate not to overshoot cap
+        S_out[K]   = std::min(p.vax_rate * S, vax_avail_rate);
+        S_out[K+1] = p.mu * S;
+        cap_outflows(S_out.data(), K+2, S, dt);
 
-        double vax_avail = std::max(0.0, max_vax - V);
-        double vax_flow  = std::min(p.vax_rate * S, vax_avail) * dt;
+        double vax_flow_rate = S_out[K];
+        double mu_S_rate     = S_out[K+1];
+        // S_out[0..K-1] = scaled infection rates from S
 
-        double dS = (p.mu * N - S * sum_lam - vax_flow / dt - p.mu * S) * dt;
+        // ---- V outflows ----
+        std::array<double, MAX_STRAINS + 2> V_out{};
+        for (int k = 0; k < K; ++k) V_out[k] = (1.0 - mp.strains[k].vax_cross) * lam[k] * V;
+        V_out[K]   = p.omega_v * V;   // waning -> S
+        V_out[K+1] = p.mu * V;
+        cap_outflows(V_out.data(), K+2, V, dt);
 
-        // waning from all R classes back to S
-        for (int k = 0; k < K; ++k)
-            dS += mp.strains[k].omega * c.R[k] * dt;
-        dS += p.omega_v * V * dt;
+        double omega_v_rate = V_out[K];
+        double mu_V_rate    = V_out[K+1];
 
-        // per-strain compartment updates
-        std::array<double, MAX_STRAINS> dE{}, dI{}, dR{}, dD{}, dH{};
+        // ---- Per-strain E, I, R outflows ----
+        // We also compute reinfection outflows from R[j] -> E[k] here, jointly capped.
+
+        // First pass: per-strain E and I outflows (no inter-strain coupling yet)
+        std::array<double, MAX_STRAINS> EI_rate{}, mu_E_rate{};
+        std::array<double, MAX_STRAINS> IR_rate{}, ID_rate{}, mu_I_rate{};
+        std::array<double, MAX_STRAINS> RS_rate{}, mu_R_rate{};
+        std::array<double, MAX_STRAINS> hosp_in_rate{}, hosp_out_rate{}, hosp_d_rate{};
+
         for (int k = 0; k < K; ++k) {
 	            if (!mp.strains[k].enabled) continue;
             auto& sk = mp.strains[k];
 
-            // new infections of strain k from S
-            double inf_from_S = lam[k] * S;
+            double e_out[2] = { sk.sigma * c.E[k], p.mu * c.E[k] };
+            cap_outflows(e_out, 2, c.E[k], dt);
+            EI_rate[k] = e_out[0]; mu_E_rate[k] = e_out[1];
 
-            // reinfections from R_j (partial cross-immunity)
-            double reinf = 0;
-            for (int j = 0; j < K; ++j) {
-	                if (j == k) continue;
-                reinf += (1.0 - mp.cross_immunity[k][j]) * lam[k] * c.R[j];
+            double i_out[3] = { sk.gamma*(1.0-sk.ifr)*c.I[k], sk.gamma*sk.ifr*c.I[k], p.mu*c.I[k] };
+            cap_outflows(i_out, 3, c.I[k], dt);
+            IR_rate[k] = i_out[0]; ID_rate[k] = i_out[1]; mu_I_rate[k] = i_out[2];
+
+            // R: waning + background death. Reinfection outflows added below.
+            double r_out[2] = { sk.omega * c.R[k], p.mu * c.R[k] };
+            cap_outflows(r_out, 2, c.R[k], dt);
+            RS_rate[k] = r_out[0]; mu_R_rate[k] = r_out[1];
+
+            hosp_in_rate[k]  = sk.hosp_rate * EI_rate[k];
+            double h_out[2]  = { c.H[k]/14.0, p.delta*c.H[k] };
+            cap_outflows(h_out, 2, c.H[k], dt);
+            hosp_out_rate[k] = h_out[0]; hosp_d_rate[k] = h_out[1];
+        }
+
+        // Reinfection: R[j] -> E[k] for k != j.
+        // For each R[j], compute how much leaves for reinfection across all k,
+        // then cap jointly with RS and mu_R already reserved.
+        std::array<std::array<double, MAX_STRAINS>, MAX_STRAINS> reinf_rate{}; // reinf_rate[k][j]
+        for (int j = 0; j < K; ++j) {
+	            if (!mp.strains[j].enabled || c.R[j] <= 0) continue;
+            // remaining capacity in R[j] after waning+death already reserved
+            double reserved = (RS_rate[j] + mu_R_rate[j]) * dt;
+            double R_free = std::max(0.0, c.R[j] - reserved);
+
+            std::array<double, MAX_STRAINS> rr{};
+            double rr_total = 0;
+            for (int k = 0; k < K; ++k) {
+	                if (k == j || !mp.strains[k].enabled) continue;
+                rr[k] = (1.0 - mp.cross_immunity[k][j]) * lam[k] * c.R[j];
+                rr_total += rr[k];
             }
+            // cap so reinfections don't exceed free capacity
+            double demand = rr_total * dt;
+            if (demand > R_free && demand > 0) {
+	                double scale = R_free / demand;
+                for (int k = 0; k < K; ++k) rr[k] *= scale;
+            }
+            for (int k = 0; k < K; ++k) reinf_rate[k][j] = rr[k];
+        }
 
-            // breakthrough from V
-            double breakthrough = (1.0 - sk.vax_cross) * lam[k] * V;
+        // ---- Apply all changes ----
+        // dS
+        double dS = 0;
+        dS += p.mu * N;                   // births
+        dS -= mu_S_rate * dt;             // background deaths from S
+        dS -= vax_flow_rate * dt;         // vaccination
+        dS += omega_v_rate * dt;          // waning from V
+        for (int k = 0; k < K; ++k) {
+	            dS -= S_out[k] * dt;          // infections from S
+            dS += RS_rate[k] * dt;        // waning from R[k]
+        }
+        S += dS; S = std::max(S, 0.0);
 
-            // superinfection from I_j (optional, small term)
+        // dV
+        double dV = 0;
+        dV += vax_flow_rate * dt;
+        dV -= omega_v_rate * dt;
+        dV -= mu_V_rate * dt;
+        for (int k = 0; k < K; ++k) dV -= V_out[k] * dt;
+        V += dV; V = std::max(V, 0.0);
+
+        for (int k = 0; k < K; ++k) {
+	            if (!mp.strains[k].enabled) continue;
+
+            // total reinfection inflow to E[k] from all R[j]
+            double reinf_in = 0;
+            for (int j = 0; j < K; ++j) reinf_in += reinf_rate[k][j];
+
+            // superinfection (optional small term)
             double superinf = 0;
             if (mp.superinf_factor > 0) {
 	                for (int j = 0; j < K; ++j) {
-	                    if (j == k) continue;
+	                    if (j == k || !mp.strains[j].enabled) continue;
                     superinf += mp.superinf_factor * lam[k] * c.I[j];
                 }
             }
 
-            double new_E = (inf_from_S + reinf + breakthrough + superinf) * dt;
-            double EI    = sk.sigma * c.E[k] * dt;
-            double IR    = sk.gamma * (1.0 - sk.ifr) * c.I[k] * dt;
-            double ID    = sk.gamma * sk.ifr * c.I[k] * dt;
-            double RS    = sk.omega * c.R[k] * dt; // already in dS
+            double E_in = S_out[k] + V_out[k] + reinf_in + superinf;
+            c.E[k] += (E_in - EI_rate[k] - mu_E_rate[k]) * dt;
+            c.E[k]  = std::max(c.E[k], 0.0);
 
-            double hosp_in  = sk.hosp_rate * EI;
-            double hosp_out = c.H[k] / 14.0 * dt;
-            double hosp_d   = p.delta * c.H[k] * dt;
+            c.I[k] += (EI_rate[k] - IR_rate[k] - ID_rate[k] - mu_I_rate[k]) * dt;
+            c.I[k]  = std::max(c.I[k], 0.0);
 
-            dE[k] = new_E - EI - p.mu * c.E[k] * dt;
-            dI[k] = EI    - IR - ID - p.mu * c.I[k] * dt;
-            dR[k] = IR    - RS - p.mu * c.R[k] * dt;
-            dD[k] = ID + hosp_d + p.mu * (c.E[k] + c.I[k] + c.R[k]) * dt;
-            dH[k] = hosp_in - hosp_out;
+            // R[k]: gains from I[k] recovery, loses to waning, background death,
+            // and reinfection to other strains' E
+            double R_reinf_out = 0;
+            for (int kk = 0; kk < K; ++kk) R_reinf_out += reinf_rate[kk][k];
+            c.R[k] += (IR_rate[k] - RS_rate[k] - mu_R_rate[k] - R_reinf_out) * dt;
+            c.R[k]  = std::max(c.R[k], 0.0);
 
-            // subtract reinfections from respective R class (they move to E_k)
-            // handled implicitly: R_k decreases only via omega (waning) above,
-            // reinfections are drawn from R_j of OTHER strains — no double-count issue
-        }
+            // Deaths: disease (ID), hosp extra (hosp_d), background from E+I+R
+            double dDk = (ID_rate[k] + hosp_d_rate[k]
+                         + mu_E_rate[k] + mu_I_rate[k] + mu_R_rate[k]) * dt;
+            c.D[k] += dDk;
 
-        double dV = (vax_flow - p.omega_v * V * dt - p.mu * V * dt);
-        // subtract breakthroughs from V into each strain's E
-        for (int k = 0; k < K; ++k)
-            dV -= (1.0 - mp.strains[k].vax_cross) * lam[k] * V * dt;
-
-        S += dS; S = std::max(S, 0.0);
-        V += dV; V = std::max(V, 0.0);
-        for (int k = 0; k < K; ++k) {
-	            c.E[k] += dE[k]; c.E[k] = std::max(c.E[k], 0.0);
-            c.I[k] += dI[k]; c.I[k] = std::max(c.I[k], 0.0);
-            c.R[k] += dR[k]; c.R[k] = std::max(c.R[k], 0.0);
-            c.D[k] += dD[k];
-            c.H[k] += dH[k]; c.H[k] = std::max(c.H[k], 0.0);
+            // Hospitalisation tracker
+            c.H[k] += (hosp_in_rate[k] - hosp_out_rate[k] - hosp_d_rate[k]) * dt;
+            c.H[k]  = std::max(c.H[k], 0.0);
 
             if (c.I[k] > res.peak_I[k]) {
 	                res.peak_I[k]  = c.I[k];
@@ -223,9 +268,7 @@ static MSRunResult avg_ms(const std::vector<MSRunResult>& runs)
 	    int n = (int)runs.size();
     size_t len = runs[0].ts.size();
     for (auto& r : runs) len = std::min(len, r.ts.size());
-
-    MSRunResult avg;
-    avg.ts.resize(len);
+    MSRunResult avg; avg.ts.resize(len);
     for (size_t t = 0; t < len; ++t) {
 	        avg.ts[t] = {};
         for (auto& r : runs) {
@@ -259,13 +302,10 @@ static MSRunResult pct_ms(const std::vector<MSRunResult>& runs, double pct)
     int idx = (int)(pct * (n - 1));
     size_t len = runs[0].ts.size();
     for (auto& r : runs) len = std::min(len, r.ts.size());
-
-    MSRunResult pr;
-    pr.ts.resize(len);
+    MSRunResult pr; pr.ts.resize(len);
     std::vector<double> buf(n);
-
     for (size_t t = 0; t < len; ++t) {
-	        pr.ts[t] = runs[n/2].ts[t]; // carry median for base fields
+	        pr.ts[t] = runs[n/2].ts[t];
         for (int k = 0; k < MAX_STRAINS; ++k) {
 	            for (int i = 0; i < n; ++i) buf[i] = runs[i].ts[t].c.I[k];
             std::sort(buf.begin(), buf.end());
