@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CLADES - Epidemiology Simulator</title>
+<style>
+body{background:#c0c0c0;color:#000;font:13px/1.5 "Arial",sans-serif;margin:0;padding:12px}
+a{color:#00008b}
+h1{font-size:22px;margin:0 0 4px}
+h2{font-size:14px;margin:16px 0 4px;border-bottom:1px solid #808080}
+h3{font-size:13px;margin:8px 0 4px}
+p{margin:0 0 8px}
+ul{margin:0 0 8px;padding-left:20px}
+pre{background:#fff;border:1px inset #808080;padding:8px;font:12px/1.6 "Courier New",monospace;overflow-x:auto;margin:0 0 8px;white-space:pre}
+table{border-collapse:collapse;width:100%;margin-bottom:8px;font-size:12px}
+td,th{border:1px solid #808080;padding:3px 6px;text-align:left}
+th{background:#000080;color:#fff}
+tr:nth-child(even) td{background:#e8e8e8}
+
+.win{background:#c0c0c0;border:2px outset #fff;margin-bottom:12px}
+.title{background:#000080;color:#fff;font:bold 12px "Arial",sans-serif;padding:3px 6px;display:flex;justify-content:space-between}
+.body{padding:8px}
+.inset{border:2px inset #808080;padding:8px;background:#fff;margin-bottom:8px}
+.row{display:flex;flex-wrap:wrap;gap:8px}
+.col{flex:1;min-width:220px}
+
+.ph{border:2px inset #808080;background:#fff;aspect-ratio:16/10;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:#808080;font:11px "Courier New",monospace;text-align:center;margin-bottom:8px}
+</style>
+</head>
+<body>
+
+<div class="win">
+  <div class="title"><span>CLADES v0.2 - Compartmental Lightweight Agent-based Disease Epidemiology Simulator</span></div>
+  <div class="body">
+    <p><b>C++17 / Dear ImGui / SDL2 / OpenGL3</b> &nbsp;&mdash;&nbsp; x86_64 Linux, cross-platform</p>
+    <p>Stochastic SEIVRD compartmental model with Ornstein-Uhlenbeck noise on &beta;, age-stratified POLYMOD contact mixing, waning immunity, and vaccination sub-compartments. Results are 5-run ensemble averages.</p>
+    <p>
+      <a href="https://github.com/onyx-the-one/CLADES">Source (GitHub)</a> &nbsp;|&nbsp;
+      <a href="#build">Build instructions</a> &nbsp;|&nbsp;
+      <a href="#model">Model details</a>
+    </p>
+  </div>
+</div>
+
+<div class="win">
+  <div class="title"><span>Screenshots</span></div>
+  <div class="body">
+
+    <div class="row">
+      <div class="col">
+        <div class="ph">
+          <img src="./assets/clades1.png" alt="main tab" width="960" height="640" loading="lazy">
+        </div>
+      </div>
+      <div class="col">
+        <h3>Fig. 1 &mdash; Main simulation tab</h3>
+        <p>Left pane contains all model parameters. Right pane shows four plots after a run: S/E/I/R/V compartments, cumulative deaths with 10&ndash;90% ensemble band, active hospitalisations, and R<sub>t</sub>.</p>
+        <ul>
+          <li>5-run stochastic ensemble, mean &plusmn; band plotted</li>
+          <li>R<sub>t</sub>=1 threshold line</li>
+          <li>Live progress bar per ensemble run</li>
+          <li>INI import/export of all parameters</li>
+          <li>Full time series CSV export</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col">
+        <h3>Fig. 2 &mdash; Age-stratified mode</h3>
+        <p>8 age bands (0&ndash;9 through 70+) with an editable 8&times;8 POLYMOD contact matrix. Per-group IFR, hospitalisation rate, and vaccine uptake. Separate plots for I(t), D(t), and R<sub>t</sub>(t) per group.</p>
+        <ul>
+          <li>POLYMOD 2008 / Prem 2017 default matrix</li>
+          <li>Symmetrise button (reciprocal contact correction)</li>
+          <li>Age summary table: peak I, peak day, total D per group</li>
+          <li>Separate age params INI file</li>
+        </ul>
+      </div>
+      <div class="col">
+        <div class="ph">
+          <img src="./assets/clades2.png" alt="age groups tab" width="960" height="640" loading="lazy">
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="win" id="model">
+  <div class="title"><span>Model</span></div>
+  <div class="body">
+
+    <p>Extended SEIVRD compartmental model. Deterministic backbone with stochastic SDE layer (Ornstein-Uhlenbeck on &beta;), integrated via Euler-Maruyama.</p>
+
+    <h2>Force of infection</h2>
+    <pre>Homogeneous:    &lambda; = &beta; &middot; (I + 0.3&middot;E) / N
+
+Age-stratified: &lambda;_i = &beta; &middot; &sum;_j C[i,j] &middot; I_j / N_j      (WAIFW)
+
+OU noise:       d&beta; = &theta;&middot;(&beta;_0 - &beta;)&middot;dt + &sigma;&middot;&beta;&middot;dW
+
+Integration:    Euler-Maruyama,  dt = 0.5 d (configurable)</pre>
+
+    <h2>Compartments</h2>
+    <table>
+      <tr><th>Symbol</th><th>Description</th><th>Exits to</th></tr>
+      <tr><td>S</td><td>Susceptible</td><td>E (infection), V (vaccination)</td></tr>
+      <tr><td>E</td><td>Exposed / latent</td><td>I (at rate &sigma; = 1/incubation)</td></tr>
+      <tr><td>I</td><td>Infectious</td><td>R (1&minus;IFR), D (IFR), both at rate &gamma;</td></tr>
+      <tr><td>H</td><td>Hospitalised (flow tracker)</td><td>resolved at 1/14 d, extra mort &delta;</td></tr>
+      <tr><td>R</td><td>Recovered</td><td>S (waning &omega;<sub>r</sub>)</td></tr>
+      <tr><td>V</td><td>Vaccinated</td><td>E (breakthrough, efficacy-reduced), S (waning &omega;<sub>v</sub>)</td></tr>
+      <tr><td>D</td><td>Dead (absorbing)</td><td>&mdash;</td></tr>
+    </table>
+
+    <h2>Age-stratified extension</h2>
+    <p>8 groups: 0&ndash;9, 10&ndash;19, 20&ndash;29, 30&ndash;39, 40&ndash;49, 50&ndash;59, 60&ndash;69, 70+. Contact matrix C[i,j] defaults to POLYMOD European average (Mossong 2008, Prem 2017). IFR follows a COVID-like age gradient as default; all values user-editable. Vaccination budget distributed proportionally to group-level uptake fractions, capped at configurable coverage ceiling per group.</p>
+
+    <h2>Ensemble strategy</h2>
+    <p>N_RUNS=5 independent Euler-Maruyama integrations from distinct MT19937-64 seeds. Time series averaged pointwise. 10th and 90th percentile bands computed per compartment. Removes single-seed luck without masking structural uncertainty.</p>
+
+    <h2>Parameters</h2>
+    <table>
+      <tr><th>Parameter</th><th>Default</th><th>Description</th></tr>
+      <tr><td>&beta;</td><td>0.3</td><td>Baseline contact &times; transmission probability (per day)</td></tr>
+      <tr><td>&sigma;</td><td>0.2</td><td>1 / incubation period (E&rarr;I rate)</td></tr>
+      <tr><td>&gamma;</td><td>0.1</td><td>1 / infectious period</td></tr>
+      <tr><td>IFR</td><td>0.01</td><td>Infection fatality ratio</td></tr>
+      <tr><td>hosp_rate</td><td>0.05</td><td>Fraction of I requiring hospitalisation</td></tr>
+      <tr><td>&omega;<sub>r</sub></td><td>0.003</td><td>Waning rate, recovered (~1 yr)</td></tr>
+      <tr><td>&omega;<sub>v</sub></td><td>0.002</td><td>Waning rate, vaccinated</td></tr>
+      <tr><td>vax_rate</td><td>0.0</td><td>Daily fraction of S vaccinated</td></tr>
+      <tr><td>vax_eff</td><td>0.85</td><td>Vaccine efficacy against infection</td></tr>
+      <tr><td>season_amp</td><td>0.0</td><td>Cosine forcing amplitude on &beta;</td></tr>
+      <tr><td>&sigma;<sub>OU</sub></td><td>0.05</td><td>OU noise amplitude (fraction of &beta;)</td></tr>
+      <tr><td>&theta;<sub>OU</sub></td><td>0.1</td><td>OU mean-reversion speed</td></tr>
+    </table>
+
+  </div>
+</div>
+
+<div class="win" id="build">
+  <div class="title"><span>Build</span></div>
+  <div class="body">
+    <p>CMake 3.18+, C++17 compiler, OpenGL. SDL2 and Dear ImGui fetched automatically via FetchContent if not present on the system.</p>
+    <pre># Linux (primary target)
+sudo apt install libsdl2-dev libgl-dev   # optional; FetchContent fallback
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+./build/clades
+
+# Windows / macOS - identical
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build</pre>
+
+    <h2>Source files</h2>
+    <table>
+      <tr><th>File</th><th>Role</th></tr>
+      <tr><td>model.hpp / model.cpp</td><td>Homogeneous SEIVRD integrator, ensemble runner, all core types</td></tr>
+      <tr><td>age_strat.hpp / age_strat.cpp</td><td>Age-stratified integrator, POLYMOD defaults, per-group ensemble</td></tr>
+      <tr><td>io.hpp / io.cpp</td><td>INI param save/load for base and age params</td></tr>
+      <tr><td>main.cpp</td><td>Dear ImGui frontend, all UI panels, SDL2/OpenGL loop</td></tr>
+    </table>
+
+    <h2>Auto-fetched dependencies</h2>
+    <table>
+      <tr><th>Library</th><th>Version</th><th>Purpose</th></tr>
+      <tr><td>Dear ImGui</td><td>1.90.8</td><td>Immediate-mode GUI</td></tr>
+      <tr><td>ImPlot</td><td>0.16</td><td>Plot widgets inside ImGui</td></tr>
+      <tr><td>SDL2</td><td>2.30.2</td><td>Window, OpenGL context, input</td></tr>
+    </table>
+  </div>
+</div>
+
+<p style="font-size:11px;color:#666">CLADES &mdash; open source, C++17 &nbsp;|&nbsp; <a href="https://github.com">github</a></p>
+
+</body>
+</html>
