@@ -1,5 +1,7 @@
-# CLADES
+# CLADES 
 **Compartmental Lightweight Agent-based Disease Epidemiology Simulator**
+
+[![CodeFactor](https://www.codefactor.io/repository/github/onyx-the-one/clades/badge)](https://www.codefactor.io/repository/github/onyx-the-one/clades)
 
 SEIVRD stochastic epidemic model with ImGui frontend. Runs a 5-run Monte Carlo ensemble and averages results to reduce stochastic noise.
 
