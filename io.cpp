@@ -158,3 +158,74 @@ std::string load_age_params(AgeParams& ap, const std::string& path)
     }
     return "";
 }
+// ---- multi-strain I/O -------------------------------------------------------
+#include "multi_strain.hpp"
+
+std::string save_ms_params(const MultiStrainParams& mp, const std::string& path)
+{
+	    std::ofstream f(path);
+    if (!f) return "cannot open " + path;
+    f << "# CLADES multi-strain parameter file\n";
+    f << "n_strains = " << mp.n_strains << "\n";
+    f << "superinf_factor = " << mp.superinf_factor << "\n";
+    for (int k = 0; k < MAX_STRAINS; ++k) {
+	        auto& sk = mp.strains[k];
+        std::string pfx = "s" + std::to_string(k) + "_";
+        f << pfx << "name = "       << sk.name       << "\n";
+        f << pfx << "enabled = "    << sk.enabled     << "\n";
+        f << pfx << "beta = "       << sk.beta        << "\n";
+        f << pfx << "sigma = "      << sk.sigma       << "\n";
+        f << pfx << "gamma = "      << sk.gamma       << "\n";
+        f << pfx << "ifr = "        << sk.ifr         << "\n";
+        f << pfx << "hosp_rate = "  << sk.hosp_rate   << "\n";
+        f << pfx << "omega = "      << sk.omega       << "\n";
+        f << pfx << "vax_cross = "  << sk.vax_cross   << "\n";
+        f << pfx << "intro_day = "  << sk.intro_day   << "\n";
+        f << pfx << "intro_size = " << sk.intro_size  << "\n";
+    }
+    for (int k = 0; k < MAX_STRAINS; ++k)
+        for (int j = 0; j < MAX_STRAINS; ++j)
+            f << "xi_" << k << "_" << j << " = " << mp.cross_immunity[k][j] << "\n";
+    return "";
+}
+
+std::string load_ms_params(MultiStrainParams& mp, const std::string& path)
+{
+	    std::ifstream f(path);
+    if (!f) return "cannot open " + path;
+    std::unordered_map<std::string,std::string> kv;
+    std::string line;
+    while (std::getline(f, line)) {
+	        if (line.empty() || line[0] == '#') continue;
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0,eq), v = line.substr(eq+1);
+        auto trim=[](std::string& s){ size_t a=s.find_first_not_of(" \t\r"),b=s.find_last_not_of(" \t\r"); s=(a==std::string::npos)?""  :s.substr(a,b-a+1); };
+        trim(k); trim(v); kv[k]=v;
+    }
+    auto getd=[&](const std::string& k,double& d){ auto it=kv.find(k); if(it!=kv.end()) try{d=std::stod(it->second);}catch(...){} };
+    auto geti=[&](const std::string& k,int& d){    auto it=kv.find(k); if(it!=kv.end()) try{d=std::stoi(it->second);}catch(...){} };
+    auto getb=[&](const std::string& k,bool& d){   auto it=kv.find(k); if(it!=kv.end()) d=(it->second=="1"||it->second=="true"); };
+    auto gets=[&](const std::string& k,std::string& d){ auto it=kv.find(k); if(it!=kv.end()) d=it->second; };
+    geti("n_strains", mp.n_strains);
+    getd("superinf_factor", mp.superinf_factor);
+    for (int k = 0; k < MAX_STRAINS; ++k) {
+	        std::string pfx = "s" + std::to_string(k) + "_";
+        auto& sk = mp.strains[k];
+        gets(pfx+"name",       sk.name);
+        getb(pfx+"enabled",    sk.enabled);
+        getd(pfx+"beta",       sk.beta);
+        getd(pfx+"sigma",      sk.sigma);
+        getd(pfx+"gamma",      sk.gamma);
+        getd(pfx+"ifr",        sk.ifr);
+        getd(pfx+"hosp_rate",  sk.hosp_rate);
+        getd(pfx+"omega",      sk.omega);
+        getd(pfx+"vax_cross",  sk.vax_cross);
+        getd(pfx+"intro_day",  sk.intro_day);
+        getd(pfx+"intro_size", sk.intro_size);
+    }
+    for (int k=0;k<MAX_STRAINS;++k)
+        for (int j=0;j<MAX_STRAINS;++j)
+            getd("xi_"+std::to_string(k)+"_"+std::to_string(j), mp.cross_immunity[k][j]);
+    return "";
+}
