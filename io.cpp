@@ -104,3 +104,57 @@ std::string load_params(Params& p, const std::string& path)
     getd("dt",            p.dt);
     return "";
 }
+
+// ---- age params I/O --------------------------------------------------------
+#include "age_strat.hpp"
+
+std::string save_age_params(const AgeParams& ap, const std::string& path)
+{
+	    std::ofstream f(path);
+    if (!f) return "cannot open " + path;
+    f << "# CLADES age-stratified parameter file\n";
+    for (int i = 0; i < N_AGE; ++i)
+        f << "pop_frac_" << i << " = " << ap.pop_frac[i] << "\n";
+    for (int i = 0; i < N_AGE; ++i)
+        f << "ifr_" << i << " = " << ap.ifr[i] << "\n";
+    for (int i = 0; i < N_AGE; ++i)
+        f << "hosp_rate_" << i << " = " << ap.hosp_rate[i] << "\n";
+    for (int i = 0; i < N_AGE; ++i)
+        f << "vax_uptake_" << i << " = " << ap.vax_uptake[i] << "\n";
+    for (int i = 0; i < N_AGE; ++i)
+        for (int j = 0; j < N_AGE; ++j)
+            f << "C_" << i << "_" << j << " = " << ap.C[i][j] << "\n";
+    return "";
+}
+
+std::string load_age_params(AgeParams& ap, const std::string& path)
+{
+	    std::ifstream f(path);
+    if (!f) return "cannot open " + path;
+    std::unordered_map<std::string, std::string> kv;
+    std::string line;
+    while (std::getline(f, line)) {
+	        if (line.empty() || line[0] == '#') continue;
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+        auto trim = [](std::string& s){
+	            size_t a = s.find_first_not_of(" \t\r"), b = s.find_last_not_of(" \t\r");
+            s = (a == std::string::npos) ? "" : s.substr(a, b-a+1);
+        };
+        trim(k); trim(v); kv[k] = v;
+    }
+    auto getd = [&](const std::string& k, double& dst) {
+	        auto it = kv.find(k); if (it == kv.end()) return;
+        try { dst = std::stod(it->second); } catch(...) {}
+    };
+    for (int i = 0; i < N_AGE; ++i) {
+	        getd("pop_frac_"  + std::to_string(i), ap.pop_frac[i]);
+        getd("ifr_"       + std::to_string(i), ap.ifr[i]);
+        getd("hosp_rate_" + std::to_string(i), ap.hosp_rate[i]);
+        getd("vax_uptake_"+ std::to_string(i), ap.vax_uptake[i]);
+        for (int j = 0; j < N_AGE; ++j)
+            getd("C_" + std::to_string(i) + "_" + std::to_string(j), ap.C[i][j]);
+    }
+    return "";
+}
