@@ -883,6 +883,11 @@ int main(int, char**)
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
+    // 17px is the minimum comfortable size on 1080p+ displays
+    ImFontConfig fcfg; fcfg.SizePixels = 17.0f;
+    io.Fonts->AddFontDefault(&fcfg);
+    io.FontDefault = io.Fonts->Fonts.back();
+
     apply_retro_style();
 
     ImGui_ImplSDL2_InitForOpenGL(win, gl_ctx);
